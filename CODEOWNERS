@@ -1,0 +1,17 @@
+# cognis-trade — code owners
+# Format: <path> <owner(s)>
+# Owners require review approval for matching paths.
+
+# Catch-all
+*                                       @cognis-ai/platform-eng
+
+# License gate — touchy
+/tools/check_no_proprietary.py          @cognis-ai/platform-eng
+/.github/workflows/license-gate.yml     @cognis-ai/platform-eng
+
+# Upstream rebase bot — touchy
+/.github/workflows/upstream-rebase.yml  @cognis-ai/platform-eng
+
+# FORK doc — every change here must be reviewed
+/FORK.md                                @cognis-ai/platform-eng
+/CLAUDE.md                              @cognis-ai/platform-eng

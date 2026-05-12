@@ -1,0 +1,113 @@
+name: Upstream rebase
+
+on:
+  # schedule:
+  #   - cron: '0 6 * * *' # 06:00 UTC daily — DISABLED at fork-bootstrap.
+  #   Flip this on AFTER the first manual workflow_dispatch run has produced
+  #   a clean rebase against hummingbot/hummingbot:master. Hummingbot's
+  #   release pace can produce noisy Cython rebases — get one clean baseline
+  #   before going autonomous. Until then, run the bot manually from the
+  #   Actions tab.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: cognis/main
+          # Prefer a PAT so the resulting PR push triggers downstream CI
+          # (GITHUB_TOKEN-driven pushes intentionally don't). Falls back to
+          # GITHUB_TOKEN so the bot still works before a PAT is configured.
+          token: ${{ secrets.REBASE_BOT_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "cognis-rebase-bot"
+          git config user.email "bot@cognisai.com"
+          git config rerere.enabled true
+          git config rerere.autoUpdate true
+
+      - name: Restore rerere cache
+        run: |
+          mkdir -p .git/rr-cache
+          if [ -d infra/rerere-cache ]; then
+            cp -R infra/rerere-cache/. .git/rr-cache/
+          fi
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/hummingbot/hummingbot
+          git fetch upstream master
+
+      - name: Update vendor/upstream branch
+        run: |
+          git checkout -B vendor/upstream upstream/master
+          git push origin vendor/upstream --force
+
+      - name: Try rebase
+        id: rebase
+        run: |
+          set +e
+          git checkout -B rebase-staging cognis/main
+          git rebase vendor/upstream
+          if [ $? -eq 0 ]; then
+            echo "result=clean" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Hummingbot is single-tier Apache-2.0 — no strip recipe at fork
+          # time, so the enterprise/ modify-delete auto-resolver from
+          # cognis-support is not applicable here. Any conflict is a real
+          # conflict (most likely in Cython .pyx / .pxd or strategy_v2/).
+          echo "result=conflict" >> "$GITHUB_OUTPUT"
+          git rebase --abort 2>/dev/null
+          exit 0
+
+      - name: Push & open PR on clean rebase
+        if: steps.rebase.outputs.result == 'clean'
+        env:
+          GH_TOKEN: ${{ secrets.REBASE_BOT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          AHEAD=$(git rev-list --count cognis/main..rebase-staging)
+          if [ "$AHEAD" = "0" ]; then
+            echo "No new upstream commits."
+            exit 0
+          fi
+          git push origin rebase-staging --force
+          # PR-creation needs either (a) org setting "Allow GitHub Actions to
+          # create and approve pull requests" enabled, or (b) a REBASE_BOT_TOKEN
+          # PAT. Until one is set up, GITHUB_TOKEN gets 403 here. The rebased
+          # branch is pushed regardless — operators can open the PR manually.
+          if ! PR_URL=$(gh pr create \
+            --base cognis/main \
+            --head rebase-staging \
+            --title "chore: upstream rebase $(date -I)" \
+            --body "Automated rebase onto vendor/upstream. $AHEAD new upstream commit(s)." 2>&1); then
+            echo "::warning::PR creation blocked (likely org policy). Branch is pushed; open the PR manually."
+            echo "Detail: $PR_URL"
+            exit 0
+          fi
+          echo "Created: $PR_URL"
+          gh pr edit "$PR_URL" --add-label rebase-auto 2>/dev/null || true
+
+      - name: Open issue on conflict
+        if: steps.rebase.outputs.result == 'conflict'
+        env:
+          GH_TOKEN: ${{ secrets.REBASE_BOT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          if ! ISSUE_URL=$(gh issue create \
+            --title "Upstream rebase conflict $(date -I)" \
+            --body "Rebase onto vendor/upstream hit conflicts. Manual resolution required." 2>&1); then
+            echo "::warning::Issue creation failed; check the run log."
+            echo "Detail: $ISSUE_URL"
+            exit 0
+          fi
+          echo "Created: $ISSUE_URL"
+          gh issue edit "$ISSUE_URL" --add-label rebase-conflict 2>/dev/null || true

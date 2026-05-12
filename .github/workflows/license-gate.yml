@@ -1,0 +1,49 @@
+name: License gate
+
+on:
+  pull_request:
+    branches: [cognis/main]
+  push:
+    branches: [cognis/main]
+
+jobs:
+  license:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with: { fetch-depth: 0 }
+
+      - name: Block presence of proprietary trap directories
+        run: |
+          set -e
+          for trap in enterprise/app enterprise/lib enterprise/config ee cloud pro saas platform; do
+            if [ -d "$trap" ] && [ "$(ls -A "$trap" 2>/dev/null | grep -v '^\.gitkeep$' | head -1)" ]; then
+              echo "::error::Proprietary trap directory present and non-empty: $trap"
+              exit 1
+            fi
+          done
+          echo "OK: no proprietary trap directories"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+
+      - name: Install ScanCode Toolkit
+        run: |
+          python -m pip install --upgrade pip
+          pip install "scancode-toolkit==32.*"
+
+      - name: Run ScanCode
+        run: |
+          scancode --license --json-pp scancode.json --processes 2 --license-score 50 \
+            --ignore "node_modules/*" --ignore "tmp/*" --ignore "log/*" --ignore "vendor/bundle/*" \
+            .
+
+      - name: Enforce license allowlist
+        run: python tools/check_no_proprietary.py scancode.json
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scancode-report
+          path: scancode.json
