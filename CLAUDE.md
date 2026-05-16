@@ -46,6 +46,10 @@ Hummingbot is the **most technical fork in the Cognis platform**. The productiza
 
 This is upstream Hummingbot tooling: conda env, `./compile`, `pytest`. **Do NOT run pip/uv/poetry installs as part of fork-bootstrap or routine Claude work** — Hummingbot's build is heavy (Cython compile, full conda env) and the platform owner's instruction is explicit: no pip installs from Claude. See upstream README + CONTRIBUTING.md for human-driven build steps.
 
+## Cost policy
+
+This fork inherits Cognis's managed-SaaS cost policy — see `../cognis-platform/docs/specs/cost-policy.md` for the full per-fork list and rationale. `cognis-trade` has NO Cognis-billable SaaS DSNs to gate — upstream Hummingbot ships no telemetry SaaS hooks. There's nothing to unset; the policy still applies if a future upstream rebase introduces one.
+
 ## What NOT to do
 
 - Don't `import openai` / `import anthropic` / `import litellm` here — strategy intelligence comes from Bridge
