@@ -1,0 +1,96 @@
+# =============================================================================
+# Cognis Trade — Docker image
+# Wraps upstream's Hummingbot build with the Cognis CLI entrypoint
+# (bin/cognis_trade.py) + COGNIS_BRANDING=on default. Builds the same
+# Cython artifacts as the upstream Dockerfile by depending on it as the
+# builder stage — zero edits to the upstream Dockerfile.
+# =============================================================================
+
+# Re-use the upstream builder stage exactly. The platform-side image build
+# (`docker build -f Dockerfile.cognis`) re-runs that stage in-context. The
+# alternative — `FROM cognis/trade-builder:dev` — keeps it cached across
+# Cognis-only edits but requires a two-step pipeline. v1 prefers
+# the single-Dockerfile path for setup-trade.md simplicity.
+FROM continuumio/miniconda3:latest AS builder
+
+RUN apt-get update && \
+    apt-get install -y sudo libusb-1.0 gcc g++ python3-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /home/hummingbot
+
+COPY setup/environment.yml /tmp/environment.yml
+RUN conda env create -f /tmp/environment.yml && \
+    conda clean -afy && \
+    rm /tmp/environment.yml
+
+COPY bin/ bin/
+COPY hummingbot/ hummingbot/
+COPY scripts/ scripts/
+COPY controllers/ controllers/
+COPY scripts/ scripts-copy/
+COPY setup.py .
+COPY LICENSE .
+COPY README.md .
+COPY COGNIS-README.md ./COGNIS-README.md
+
+SHELL [ "/bin/bash", "-lc" ]
+RUN echo "conda activate hummingbot" >> ~/.bashrc
+
+COPY setup/pip_packages.txt /tmp/pip_packages.txt
+RUN python3 -m pip install --no-deps -r /tmp/pip_packages.txt && \
+    rm /tmp/pip_packages.txt
+
+RUN python3 setup.py build_ext --inplace -j 8 && \
+    rm -rf build/ && \
+    find . -type f -name "*.cpp" -delete
+
+
+# ----- Cognis release stage --------------------------------------------------
+FROM continuumio/miniconda3:latest AS release
+
+LABEL maintainer="Cognis AI <support@cognisai.com>"
+LABEL org.opencontainers.image.source="https://github.com/cognis-ai/cognis-trade"
+LABEL org.opencontainers.image.title="Cognis Trade"
+LABEL org.opencontainers.image.description="Cognis Trade — packaged algorithmic trading worker. Forked from hummingbot/hummingbot (Apache-2.0)."
+LABEL org.opencontainers.image.vendor="Cognis AI"
+
+ARG BRANCH=""
+ARG COMMIT=""
+ARG BUILD_DATE=""
+LABEL branch=${BRANCH}
+LABEL commit=${COMMIT}
+LABEL date=${BUILD_DATE}
+
+ENV COMMIT_SHA=${COMMIT}
+ENV COMMIT_BRANCH=${BRANCH}
+ENV BUILD_DATE=${BUILD_DATE}
+ENV INSTALLATION_TYPE=cognis-docker
+
+# Cognis-defaults — overridable at run time per cost-policy.md.
+ENV COGNIS_BRANDING=on \
+    COGNIS_PRODUCT_NAME="Cognis Trade" \
+    COGNIS_DOCS_URL="https://cognisai.com/docs/trade" \
+    COGNIS_PORTAL_URL="https://app.cognisai.com/dashboard/trade" \
+    COGNIS_SUPPORT_EMAIL="support@cognisai.com"
+
+RUN apt-get update && \
+    apt-get install -y sudo libusb-1.0 && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /home/hummingbot/conf /home/hummingbot/conf/connectors \
+    /home/hummingbot/conf/strategies /home/hummingbot/conf/controllers \
+    /home/hummingbot/conf/scripts /home/hummingbot/logs /home/hummingbot/data \
+    /home/hummingbot/certs /home/hummingbot/scripts /home/hummingbot/controllers
+
+WORKDIR /home/hummingbot
+
+COPY --from=builder /opt/conda/ /opt/conda/
+COPY --from=builder /home/ /home/
+
+SHELL [ "/bin/bash", "-lc" ]
+
+# Cognis entrypoint: drives the bot from Bridge when COGNIS_BRIDGE_URL +
+# COGNIS_TRADE_API_TOKEN are set, otherwise falls through to upstream's
+# bin/hummingbot.py (parity).
+CMD conda activate hummingbot && ./bin/cognis_trade.py 2>> ./logs/errors.log
