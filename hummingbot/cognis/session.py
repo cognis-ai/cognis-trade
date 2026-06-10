@@ -54,6 +54,11 @@ class CognisSession:
         self._running_strategy_ids: set[str] = set()
         self._event_buffer: List[Dict[str, Any]] = []
         self._stop = asyncio.Event()
+        # Active paper-trade engine runners, keyed by strategy id. Populated
+        # by _start_strategy when a paper strategy launches; drained on stop.
+        self._runners: Dict[str, Any] = {}
+        # Strategy defs we've started, so _stop_strategy can post paper results.
+        self._started_defs: Dict[str, StrategyDef] = {}
 
     @classmethod
     async def bootstrap(cls) -> "CognisSession":
@@ -167,42 +172,104 @@ class CognisSession:
             )
             return
 
-        # TODO(v1.5): wire to HummingbotApplication.start() with the strategy
-        # config translated from our schema to Hummingbot's YAML. For v1, the
-        # bot validates the wiring end-to-end (Bridge → bot → Bridge events)
-        # without executing trades.
         self._running_strategy_ids.add(strat.id)
+        self._started_defs[strat.id] = strat
+        mode = "live" if strat.is_live() else "paper"
         logger.info(
-            "%s: would start strategy %r (%s/%s/%s)",
+            "%s: starting strategy %r (%s/%s/%s) mode=%s",
             cognis_log_prefix(),
             strat.name,
             strat.kind,
             strat.exchange,
             strat.trading_pair,
+            mode,
         )
         asyncio.create_task(
             self._emit_event(
                 {
                     "type": "strategy_started",
                     "strategyId": strat.id,
-                    "payload": {"kind": strat.kind, "pair": strat.trading_pair, "mode": "paper" if not strat.is_live() else "live"},
+                    "payload": {"kind": strat.kind, "pair": strat.trading_pair, "mode": mode},
                 }
             )
         )
+
+        # Genuine engine execution: spin up a real Hummingbot paper-trade
+        # connector + clock loop for paper strategies. The runner forwards
+        # REAL connector order/fill events back to Bridge via _emit_event.
+        # Live execution is intentionally NOT wired here yet — Bridge gates
+        # go-live and live wiring is a follow-up; live strategies still emit
+        # strategy_started so the portal reflects state.
+        if not strat.is_live():
+            asyncio.create_task(self._launch_paper_runner(strat))
+
+    async def _launch_paper_runner(self, strat: StrategyDef) -> None:
+        """Build + start a PaperStrategyRunner; emit an error if it fails."""
+        from hummingbot.cognis.paper_runner import PaperStrategyRunner
+
+        try:
+            runner = PaperStrategyRunner(
+                strat, emit=self._emit_event, guards=self._guards
+            )
+            await runner.start()
+            self._runners[strat.id] = runner
+        except Exception as err:  # noqa: BLE001 — never let a runner crash the session
+            logger.exception(
+                "%s: failed to launch paper runner for %s", cognis_log_prefix(), strat.id
+            )
+            await self._emit_event(
+                {
+                    "type": "error",
+                    "strategyId": strat.id,
+                    "payload": {
+                        "message": f"paper engine failed to start: {err}",
+                        "code": "paper_runner_start_failed",
+                    },
+                }
+            )
 
     def _stop_strategy(self, strategy_id: str, *, reason: str) -> None:
         if strategy_id not in self._running_strategy_ids:
             return
         self._running_strategy_ids.discard(strategy_id)
         logger.info("%s: stopping strategy %s (reason=%s)", cognis_log_prefix(), strategy_id, reason)
-        asyncio.create_task(
-            self._emit_event(
-                {
-                    "type": "strategy_stopped",
-                    "strategyId": strategy_id,
-                    "payload": {"reason": reason},
-                }
-            )
+        asyncio.create_task(self._teardown_strategy(strategy_id, reason=reason))
+
+    async def _teardown_strategy(self, strategy_id: str, *, reason: str) -> None:
+        """Stop the paper runner (if any), post paper results, emit stopped."""
+        runner = self._runners.pop(strategy_id, None)
+        results: Optional[Dict[str, Any]] = None
+        if runner is not None:
+            try:
+                results = await runner.stop()
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "%s: error stopping paper runner for %s",
+                    cognis_log_prefix(),
+                    strategy_id,
+                )
+
+        # If the strategy actually executed paper trades, report results so
+        # Bridge transitions it to paper_completed from REAL activity. Done
+        # BEFORE strategy_stopped so the portal reflects the completion first.
+        if results is not None and results.get("orders_placed"):
+            try:
+                await self._bridge.post_paper_results(strategy_id, results)
+            except CognisBridgeError as err:
+                logger.warning(
+                    "%s: post_paper_results failed for %s: %s",
+                    cognis_log_prefix(),
+                    strategy_id,
+                    err,
+                )
+
+        self._started_defs.pop(strategy_id, None)
+        await self._emit_event(
+            {
+                "type": "strategy_stopped",
+                "strategyId": strategy_id,
+                "payload": {"reason": reason, "results": results},
+            }
         )
 
     # ---------------------------------------------------------------------

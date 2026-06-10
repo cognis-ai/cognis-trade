@@ -48,10 +48,38 @@ def _bridge_mode_configured() -> bool:
     )
 
 
+def _configure_bridge_logging() -> None:
+    """Send Cognis-layer logs to stdout in Bridge mode.
+
+    Upstream's ``init_logging`` only runs on the CLI passthrough path; the
+    Bridge-managed path skips ``HummingbotApplication`` entirely, so without
+    this the bot runs silently. We configure a stdout handler at INFO so the
+    worker's ``docker logs`` shows the real connector start, clock activity,
+    and order/fill lifecycle (operability + audit). Level overridable via
+    ``COGNIS_LOG_LEVEL``.
+    """
+    import logging
+
+    level_name = os.environ.get("COGNIS_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    root = logging.getLogger()
+    if not root.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        )
+        root.addHandler(handler)
+    # Default the root to WARNING (upstream order-book/network loggers are
+    # noisy), but let the Cognis lifecycle loggers run at the chosen level.
+    root.setLevel(logging.WARNING)
+    logging.getLogger("hummingbot.cognis").setLevel(level)
+
+
 async def _run_bridge_session() -> None:
     """The production path — Bridge-managed bot lifecycle."""
     # Imported lazily so the upstream parity path doesn't pay for httpx
     # / risk-guard imports unless the customer is on the Cognis platform.
+    _configure_bridge_logging()
     from hummingbot.cognis.session import CognisSession
 
     session = await CognisSession.bootstrap()
