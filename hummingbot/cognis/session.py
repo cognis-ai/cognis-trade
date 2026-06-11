@@ -194,13 +194,19 @@ class CognisSession:
             )
         )
 
-        # Genuine engine execution: spin up a real Hummingbot paper-trade
-        # connector + clock loop for paper strategies. The runner forwards
-        # REAL connector order/fill events back to Bridge via _emit_event.
-        # Live execution is intentionally NOT wired here yet — Bridge gates
-        # go-live and live wiring is a follow-up; live strategies still emit
-        # strategy_started so the portal reflects state.
-        if not strat.is_live():
+        # Genuine engine execution. The runner forwards REAL connector
+        # order/fill events back to Bridge via _emit_event.
+        #   * paper strategies -> PaperStrategyRunner (PaperTradeExchange).
+        #   * live strategies  -> LiveStrategyRunner (real authenticated
+        #     connector pointed at Binance Spot Testnet). Bridge only reports a
+        #     strategy as live_running AFTER the go-live gate (liveConfirmation
+        #     + completed paper run + configured exchange key + plan allows
+        #     live), so reaching this branch is itself the gate; the runner
+        #     additionally asserts is_live() defensively. RiskGuards is
+        #     enforced per live order inside the runner.
+        if strat.is_live():
+            asyncio.create_task(self._launch_live_runner(strat))
+        else:
             asyncio.create_task(self._launch_paper_runner(strat))
 
     async def _launch_paper_runner(self, strat: StrategyDef) -> None:
@@ -227,6 +233,82 @@ class CognisSession:
                     },
                 }
             )
+
+    async def _launch_live_runner(self, strat: StrategyDef) -> None:
+        """Build + start a LiveStrategyRunner against the real venue connector.
+
+        Resolves the tenant's per-tenant exchange key for the strategy's venue
+        from the Bridge config (delivered with ?include=keys post auth-
+        hardening). If no key is present, emits an error rather than silently
+        falling back to paper — going live without keys must be loud.
+        """
+        from hummingbot.cognis.live_runner import LiveStrategyRunner
+
+        assert self._config is not None
+
+        key = self._resolve_live_key(strat)
+        if key is None:
+            logger.error(
+                "%s: cannot start LIVE strategy %s — no exchange key for venue %r "
+                "in Bridge config (request keys:read + ?include=keys).",
+                cognis_log_prefix(),
+                strat.id,
+                strat.exchange,
+            )
+            await self._emit_event(
+                {
+                    "type": "error",
+                    "strategyId": strat.id,
+                    "payload": {
+                        "code": "live_no_exchange_key",
+                        "message": (
+                            f"live strategy {strat.name!r} has no exchange key for "
+                            f"venue {strat.exchange!r}; Bridge must deliver it via "
+                            f"keys:read + ?include=keys"
+                        ),
+                    },
+                }
+            )
+            return
+
+        try:
+            runner = LiveStrategyRunner(
+                strat, key, emit=self._emit_event, guards=self._guards, use_testnet=True
+            )
+            await runner.start()
+            self._runners[strat.id] = runner
+        except Exception as err:  # noqa: BLE001 — never let a runner crash the session
+            logger.exception(
+                "%s: failed to launch live runner for %s", cognis_log_prefix(), strat.id
+            )
+            await self._emit_event(
+                {
+                    "type": "error",
+                    "strategyId": strat.id,
+                    "payload": {
+                        "message": f"live engine failed to start: {err}",
+                        "code": "live_runner_start_failed",
+                    },
+                }
+            )
+
+    def _resolve_live_key(self, strat: StrategyDef):
+        """Find the tenant exchange key matching the strategy's venue.
+
+        Accepts the venue name directly (``binance``) or testnet aliases. Live
+        strategies should be configured with the real venue id; keys are stored
+        by venue in Bridge.
+        """
+        assert self._config is not None
+        candidates = {strat.exchange, "binance", "binance_testnet", "binance_spot_testnet"}
+        for key in self._config.exchange_keys:
+            if key.exchange in candidates or strat.exchange.startswith(key.exchange):
+                return key
+        # Fall back to the first key for the same base venue (binance*).
+        for key in self._config.exchange_keys:
+            if key.exchange.split("_")[0] == strat.exchange.split("_")[0]:
+                return key
+        return None
 
     def _stop_strategy(self, strategy_id: str, *, reason: str) -> None:
         if strategy_id not in self._running_strategy_ids:

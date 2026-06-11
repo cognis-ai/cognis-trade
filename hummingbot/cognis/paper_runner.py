@@ -29,13 +29,29 @@ Design (kept deliberately minimal + robust for headless operation):
    return a small results summary the session posts via ``post_paper_results``
    so the strategy transitions to ``paper_completed`` from REAL activity.
 
-Why a minimal connector-driven loop and not the full ``PureMarketMakingStrategy``:
-the upstream PMM ``start.py`` is bound to the interactive ``HummingbotApplication``
-(config maps, ``self.connector_manager``, ``initialize_markets``) which is brittle
-to drive headless. The connector + clock + event lifecycle here is the SAME
-upstream machinery the strategy itself rides on — the orders and fills are
-equally real — just without the CLI app scaffolding. RiskGuards stays in the
-loop as defense-in-depth on the order notional.
+Two execution paths (chosen at runtime by ``strat.kind``):
+
+* ``pure_market_making`` → instantiate the upstream
+  ``PureMarketMakingStrategy`` directly (the way Hummingbot's own unit tests
+  do — ``init_params`` + ``clock.add_iterator``, NO ``HummingbotApplication``)
+  and add it to the same realtime clock as the connector. It posts two-sided
+  resting maker quotes (bid + ask) near the touch; the ``PaperTradeExchange``
+  fills them as the live book trades through them — genuine maker fills, not
+  crossing. This is the realistic strategy path.
+* anything else (or if PMM init throws) → fall back to the legacy
+  ``_place_crossing_order`` loop below, which lifts the ask each refresh so the
+  paper connector matches it immediately. Deterministic, but always crosses
+  (negative P&L) — a demo, not a strategy.
+
+Either way the EventForwarder listeners are identical: strategy-placed orders
+fire the SAME connector ``BuyOrderCreated`` / ``SellOrderCreated`` /
+``OrderFilled`` events, so order_placed now shows BOTH sides under the PMM path.
+
+RiskGuards: the crossing fallback validates per-order notional before placing.
+Under the PMM path the strategy places orders directly via the connector, so
+per-order interception isn't reachable without subclassing upstream (avoided);
+we keep the cap snapshot/validate at strategy-start (in the session) and a
+notional cap check at quote-config time — documented below.
 """
 
 from __future__ import annotations
@@ -44,14 +60,13 @@ import asyncio
 import logging
 import time
 from decimal import Decimal
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from hummingbot.cognis.bridge_client import StrategyDef
 from hummingbot.cognis.risk_guards import RiskGuards
+from hummingbot.cognis.runner_base import ConnectorEventRunner, EmitCallback, dec_str
 
 logger = logging.getLogger(__name__)
-
-EmitCallback = Callable[[Dict[str, Any]], Awaitable[None]]
 
 
 def _cfg_decimal(config: Any, key: str, default: str) -> Decimal:
@@ -64,13 +79,16 @@ def _cfg_decimal(config: Any, key: str, default: str) -> Decimal:
         return Decimal(default)
 
 
-class PaperStrategyRunner:
+class PaperStrategyRunner(ConnectorEventRunner):
     """Runs one Cognis strategy as a genuine paper-trade loop.
 
     One instance per running strategy. ``start()`` spins up the connector +
     clock and returns once the background task is launched; ``stop()`` tears
-    it down and returns a results summary.
+    it down and returns a results summary. Event forwarding + bookkeeping are
+    inherited from ``ConnectorEventRunner``.
     """
+
+    mode = "paper"
 
     def __init__(
         self,
@@ -79,9 +97,7 @@ class PaperStrategyRunner:
         emit: EmitCallback,
         guards: Optional[RiskGuards] = None,
     ) -> None:
-        self._strat = strat
-        self._emit = emit
-        self._guards = guards
+        super().__init__(strat, emit=emit, guards=guards)
 
         # Strategy params (sane defaults mirror the Bridge seed config).
         cfg = strat.config or {}
@@ -107,18 +123,15 @@ class PaperStrategyRunner:
             else self._exchange
         )
 
-        self._connector: Any = None
-        self._clock: Any = None
+        self._kind = (strat.kind or "").strip().lower()
+
+        # Connector/clock + bookkeeping (_connector, _clock, _orders_placed,
+        # _fills, _realized_quote, _forwarders, _listening) come from the base.
+        self._strategy: Any = None  # upstream PureMarketMakingStrategy when PMM path runs
+        self._ran_path: str = "crossing_loop_fallback"  # updated to pmm when PMM init succeeds
         self._task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
         self._loop = asyncio.get_event_loop()
-
-        # Bookkeeping for the paper-results summary.
-        self._orders_placed = 0
-        self._fills = 0
-        self._realized_quote = Decimal("0")  # signed quote delta from fills
-        self._forwarders: List[Any] = []
-        self._listening = False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -196,7 +209,36 @@ class PaperStrategyRunner:
             except Exception as err:  # noqa: BLE001
                 logger.warning("[cognis.paper] task join error: %s", err)
 
-        # Best-effort cancel of any resting orders.
+        # Stop the PMM strategy iterator (if it ran) and cancel its resting
+        # maker quotes. The clock __exit__ stops iterators too, but do it
+        # explicitly so resting bid/ask orders are cancelled deterministically.
+        try:
+            if self._strategy is not None:
+                # PMM has no bulk-cancel helper; cancel each active maker order
+                # via the strategy, then rely on the connector cancel loop below
+                # as a backstop. Stop the iterator so it doesn't re-quote.
+                try:
+                    market_info = getattr(self._strategy, "market_info", None)
+                    for o in list(getattr(self._strategy, "active_orders", []) or []):
+                        try:
+                            self._strategy.cancel_order(market_info, o.client_order_id)
+                        except Exception:  # noqa: BLE001
+                            pass
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    self._strategy.stop(self._clock)
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    if self._clock is not None:
+                        self._clock.remove_iterator(self._strategy)
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception as err:  # noqa: BLE001
+            logger.warning("[cognis.paper] strategy stop error: %s", err)
+
+        # Best-effort cancel of any resting orders still on the connector.
         try:
             if self._connector is not None:
                 for lo in list(getattr(self._connector, "limit_orders", []) or []):
@@ -216,6 +258,7 @@ class PaperStrategyRunner:
             "exchange": self._exchange,
             "pair": self._trading_pair,
             "engine": "hummingbot-paper-trade",
+            "ran_path": self._ran_path,
         }
         logger.info("[cognis.paper] strategy %s results: %s", self._strat.id, results)
         return results
@@ -227,101 +270,9 @@ class PaperStrategyRunner:
         except Exception as err:  # noqa: BLE001
             logger.warning("[cognis.paper] stop_network error: %s", err)
 
-    # ------------------------------------------------------------------
-    # Event wiring (REAL connector events → Cognis events)
-    # ------------------------------------------------------------------
-
-    def _wire_event_listeners(self) -> None:
-        from hummingbot.core.event.event_forwarder import EventForwarder
-        from hummingbot.core.event.events import MarketEvent
-
-        def _on_buy_created(evt: Any) -> None:
-            self._schedule_emit(self._order_created_event(evt, "buy"))
-
-        def _on_sell_created(evt: Any) -> None:
-            self._schedule_emit(self._order_created_event(evt, "sell"))
-
-        def _on_filled(evt: Any) -> None:
-            self._record_fill(evt)
-            self._schedule_emit(self._order_filled_event(evt))
-
-        def _on_cancelled(evt: Any) -> None:
-            self._schedule_emit(
-                {
-                    "type": "order_canceled",
-                    "strategyId": self._strat.id,
-                    "payload": {
-                        "order_id": getattr(evt, "order_id", None),
-                        "pair": self._trading_pair,
-                    },
-                }
-            )
-
-        bindings = [
-            (MarketEvent.BuyOrderCreated, _on_buy_created),
-            (MarketEvent.SellOrderCreated, _on_sell_created),
-            (MarketEvent.OrderFilled, _on_filled),
-            (MarketEvent.OrderCancelled, _on_cancelled),
-        ]
-        for tag, fn in bindings:
-            fwd = EventForwarder(fn)
-            self._connector.add_listener(tag, fwd)
-            self._forwarders.append(fwd)
-        self._listening = True
-
-    def _order_created_event(self, evt: Any, side: str) -> Dict[str, Any]:
-        return {
-            "type": "order_placed",
-            "strategyId": self._strat.id,
-            "payload": {
-                "order_id": getattr(evt, "order_id", None),
-                "pair": getattr(evt, "trading_pair", self._trading_pair),
-                "side": side,
-                "price": _dec_str(getattr(evt, "price", None)),
-                "amount": _dec_str(getattr(evt, "amount", None)),
-                "source": "hummingbot_connector",
-            },
-        }
-
-    def _order_filled_event(self, evt: Any) -> Dict[str, Any]:
-        trade_type = getattr(evt, "trade_type", None)
-        side = getattr(trade_type, "name", str(trade_type)).lower() if trade_type else None
-        return {
-            "type": "order_filled",
-            "strategyId": self._strat.id,
-            "payload": {
-                "order_id": getattr(evt, "order_id", None),
-                "pair": getattr(evt, "trading_pair", self._trading_pair),
-                "side": side,
-                "price": _dec_str(getattr(evt, "price", None)),
-                "amount": _dec_str(getattr(evt, "amount", None)),
-                "exchange_trade_id": getattr(evt, "exchange_trade_id", None),
-                "source": "hummingbot_connector",
-            },
-        }
-
-    def _record_fill(self, evt: Any) -> None:
-        self._fills += 1
-        try:
-            price = Decimal(str(getattr(evt, "price")))
-            amount = Decimal(str(getattr(evt, "amount")))
-            trade_type = getattr(evt, "trade_type", None)
-            side = getattr(trade_type, "name", "").lower()
-            quote = price * amount
-            # Buying spends quote, selling earns quote (ignoring fees) — a crude
-            # realized-quote tracker for the summary only.
-            self._realized_quote += quote if side == "sell" else -quote
-        except Exception:  # noqa: BLE001
-            pass
-
-    def _schedule_emit(self, event: Dict[str, Any]) -> None:
-        # Connector callbacks fire synchronously inside the clock tick; bounce
-        # the async emit onto the loop.
-        try:
-            asyncio.ensure_future(self._emit(event))
-        except RuntimeError:
-            # No running loop (shouldn't happen mid-run); drop rather than crash.
-            logger.debug("[cognis.paper] could not schedule emit for %s", event.get("type"))
+    # Event wiring (_wire_event_listeners, _order_created_event,
+    # _order_filled_event, _record_fill, _schedule_emit) is inherited from
+    # ConnectorEventRunner — identical for paper + live connectors.
 
     # ------------------------------------------------------------------
     # The tick + order loop
@@ -372,21 +323,48 @@ class PaperStrategyRunner:
                 return
 
             logger.info(
-                "[cognis.paper] connector ready; mid=%s — starting order loop",
+                "[cognis.paper] connector ready; mid=%s — selecting execution path",
                 self._safe_mid(),
             )
 
-            # 2) Order loop: place a crossing LIMIT order each refresh interval.
-            #    The connector fills it against the live book on the next ticks
-            #    driven by the background clock_task.
+            # 2) Choose the execution path. For pure_market_making, drive the
+            #    REAL upstream strategy (two-sided maker quoting). For anything
+            #    else — or if PMM init throws — fall back to the crossing loop.
+            pmm_started = False
+            if self._kind == "pure_market_making":
+                pmm_started = self._try_start_pmm_strategy()
+
             try:
-                last_order_ts = 0.0
-                while not self._stop.is_set():
-                    now = time.time()
-                    if now - last_order_ts >= self._order_refresh_time:
-                        self._place_crossing_order()
-                        last_order_ts = now
-                    await asyncio.sleep(1.0)
+                if pmm_started:
+                    self._ran_path = "pure_market_making_strategy"
+                    logger.info(
+                        "[cognis.paper] running PureMarketMakingStrategy "
+                        "(two-sided maker quoting) bid_spread=%s ask_spread=%s "
+                        "order_amount=%s refresh=%ss",
+                        self._bid_spread,
+                        self._ask_spread,
+                        self._order_amount,
+                        self._order_refresh_time,
+                    )
+                    # The strategy is a clock iterator now; the background
+                    # clock_task ticks it, which places + refreshes its own
+                    # bid/ask maker orders. We just supervise until stop.
+                    while not self._stop.is_set():
+                        await asyncio.sleep(1.0)
+                else:
+                    self._ran_path = "crossing_loop_fallback"
+                    logger.info(
+                        "[cognis.paper] running crossing_loop_fallback "
+                        "(kind=%r) — deterministic crossing LIMIT orders",
+                        self._kind,
+                    )
+                    last_order_ts = 0.0
+                    while not self._stop.is_set():
+                        now = time.time()
+                        if now - last_order_ts >= self._order_refresh_time:
+                            self._place_crossing_order()
+                            last_order_ts = now
+                        await asyncio.sleep(1.0)
             finally:
                 if clock_task is not None:
                     clock_task.cancel()
@@ -394,6 +372,89 @@ class PaperStrategyRunner:
                         await clock_task
                     except (asyncio.CancelledError, Exception):  # noqa: BLE001
                         pass
+
+    def _try_start_pmm_strategy(self) -> bool:
+        """Instantiate the upstream PureMarketMakingStrategy and add it to the
+        clock — the headless path Hummingbot's own unit tests use (no
+        HummingbotApplication). Returns True if the strategy was wired in.
+
+        On ANY failure we log it and return False so the caller falls back to
+        the crossing loop — an honest, working path beats a broken PMM.
+        """
+        try:
+            from hummingbot.strategy.market_trading_pair_tuple import (
+                MarketTradingPairTuple,
+            )
+            from hummingbot.strategy.pure_market_making.pure_market_making import (
+                PureMarketMakingStrategy,
+            )
+
+            base, quote = self._trading_pair.split("-")
+
+            # Optional defense-in-depth: snapshot the per-order notional cap so
+            # we don't quote sizes that would breach the plan. The strategy
+            # places via the connector directly, so we can't intercept each
+            # order through the strategy path without subclassing upstream
+            # (avoided per fork rules). We at least validate the quoted notional
+            # at config time against the guard's order cap.
+            if self._guards is not None:
+                try:
+                    mid = self._safe_mid() or Decimal("0")
+                    notional = mid * self._order_amount
+                    violation = self._guards.intercept_order(
+                        strategy=self._strat, notional_usd=notional
+                    )
+                    if violation is not None:
+                        logger.warning(
+                            "[cognis.paper] PMM quote notional blocked by guard: %s",
+                            violation.message,
+                        )
+                        self._schedule_emit(
+                            {
+                                "type": "error",
+                                "strategyId": self._strat.id,
+                                "payload": {
+                                    "message": violation.message,
+                                    "code": violation.code,
+                                },
+                            }
+                        )
+                        return False
+                except Exception as gerr:  # noqa: BLE001 — guard advisory only
+                    logger.debug("[cognis.paper] PMM guard check skipped: %s", gerr)
+
+            market_info = MarketTradingPairTuple(
+                self._connector, self._trading_pair, base, quote
+            )
+            strategy = PureMarketMakingStrategy()
+            # Map Cognis config → upstream params. Spreads are fractions
+            # (already divided by 100 in __init__). filled_order_delay is set
+            # short so the strategy re-quotes promptly after a maker fill rather
+            # than idling for the upstream 60s default — keeps the demo lively.
+            strategy.init_params(
+                market_info=market_info,
+                bid_spread=self._bid_spread,
+                ask_spread=self._ask_spread,
+                order_amount=self._order_amount,
+                order_refresh_time=float(self._order_refresh_time),
+                filled_order_delay=min(float(self._order_refresh_time), 5.0),
+                order_refresh_tolerance_pct=Decimal("0"),
+            )
+            self._strategy = strategy
+            self._clock.add_iterator(strategy)
+            logger.info(
+                "[cognis.paper] PureMarketMakingStrategy added to clock for %s",
+                self._trading_pair,
+            )
+            return True
+        except Exception as err:  # noqa: BLE001 — fall back to crossing loop
+            logger.warning(
+                "[cognis.paper] PMM init failed (%s) — falling back to crossing loop",
+                err,
+                exc_info=True,
+            )
+            self._strategy = None
+            return False
 
     async def _wait_until_ready(self, timeout_s: float = 120.0) -> bool:
         """Poll the connector's readiness while the background clock ticks."""
@@ -463,7 +524,9 @@ class PaperStrategyRunner:
             order_id = self._connector.buy(
                 self._trading_pair, amount, OrderType.LIMIT, price
             )
-            self._orders_placed += 1
+            # NOTE: orders_placed is incremented in the BuyOrderCreated listener
+            # (fires for this order too), so we do NOT bump it here to avoid
+            # double-counting.
             logger.info(
                 "[cognis.paper] placed LIMIT BUY %s %s @ %s (order_id=%s)",
                 amount,
@@ -473,12 +536,3 @@ class PaperStrategyRunner:
             )
         except Exception as err:  # noqa: BLE001
             logger.warning("[cognis.paper] buy() failed: %s", err)
-
-
-def _dec_str(val: Any) -> Optional[str]:
-    if val is None:
-        return None
-    try:
-        return str(Decimal(str(val)))
-    except Exception:  # noqa: BLE001
-        return str(val)

@@ -10,10 +10,16 @@ The cognis-trade fork uses this to talk to Cognis Bridge:
   strategy can be promoted to live (gated in the portal by an explicit
   customer confirmation).
 
-Auth: ``X-Cognis-Bot-Token: <token>`` header. The token is provisioned by
-Bridge at tenant-create time and surfaced ONCE to the customer; they paste
-it into the bot env as ``COGNIS_TRADE_API_TOKEN``. Rotation is via the
-portal's admin rotate-bot-token endpoint.
+Auth (trade-bot-auth-hardening): ``COGNIS_TRADE_API_TOKEN`` is now a *refresh*
+credential. On first use (and ~60s before expiry) the client POSTs it to
+``/trade-bot/token`` to mint a short-TTL ``Bearer`` access JWT, which it then
+sends on config/events/paper-results. On a 401 it force-refreshes once and
+retries — so a mid-run token rotation (current->previous grace on the Bridge
+side) is invisible to the worker. If ``/trade-bot/token`` 404s (older Bridge),
+the client falls back to sending the static ``X-Cognis-Bot-Token`` header, so
+old Bridges keep working. The refresh credential is provisioned by Bridge at
+tenant-create time and surfaced ONCE; rotation is via the portal's admin
+rotate-bot-token endpoint (now safe regardless of order).
 
 The bot must NEVER persist decrypted exchange keys to disk — they live in
 the BotConfig dataclass returned by ``fetch_config()``, scoped to the
@@ -28,12 +34,17 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional
 
 import aiohttp
 
 logger = logging.getLogger(__name__)
+
+# Refresh the access token this many seconds before it actually expires, so a
+# poll never races the expiry boundary.
+_ACCESS_REFRESH_SKEW_S = 60
 
 
 class CognisBridgeError(RuntimeError):
@@ -123,11 +134,17 @@ class BridgeClient:
         if not bot_token or len(bot_token) < 16:
             raise CognisBridgeError("bot_token is empty or too short")
         self._bridge_url = bridge_url.rstrip("/")
-        self._bot_token = bot_token
+        self._bot_token = bot_token  # refresh credential
         self._timeout = aiohttp.ClientTimeout(total=timeout_s, connect=3.0)
         # The session is lazily created on first call so __init__ stays sync
         # — easier to construct from non-async test code without warnings.
         self._session: Optional[aiohttp.ClientSession] = None
+        # Minted short-TTL access JWT + its absolute expiry (epoch seconds).
+        self._access_token: Optional[str] = None
+        self._access_expiry: float = 0.0
+        # Set True once /trade-bot/token returns 404 — older Bridge, fall back
+        # to the legacy static header for the rest of the process lifetime.
+        self._legacy_static_auth = False
 
     @classmethod
     def from_env(cls) -> "BridgeClient":
@@ -148,28 +165,107 @@ class BridgeClient:
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
+            # Per-request auth headers now (access JWT or legacy static) — see
+            # _auth_headers — so we only set Accept on the session here.
             self._session = aiohttp.ClientSession(
                 timeout=self._timeout,
-                headers={
-                    "X-Cognis-Bot-Token": self._bot_token,
-                    "Accept": "application/json",
-                },
+                headers={"Accept": "application/json"},
             )
         return self._session
 
-    async def fetch_config(self) -> BotConfig:
+    async def _ensure_access_token(self, *, force: bool = False) -> bool:
+        """Mint/refresh the short-TTL access JWT from the refresh credential.
+
+        Returns True if a Bearer access token is available, False if the client
+        must fall back to the legacy static header (older Bridge that 404s on
+        /trade-bot/token). Refreshes when missing, expiring within the skew, or
+        when ``force`` (a 401 forced us to).
+        """
+        if self._legacy_static_auth:
+            return False
+        if (
+            not force
+            and self._access_token
+            and time.time() < self._access_expiry - _ACCESS_REFRESH_SKEW_S
+        ):
+            return True
         session = await self._ensure_session()
         try:
-            async with session.get(f"{self._bridge_url}/trade-bot/config") as resp:
+            async with session.post(
+                f"{self._bridge_url}/trade-bot/token",
+                headers={"X-Cognis-Bot-Token": self._bot_token},
+            ) as resp:
+                if resp.status == 404:
+                    # Older Bridge without the mint endpoint — fall back forever.
+                    logger.info(
+                        "cognis: /trade-bot/token not found; using legacy static-header auth"
+                    )
+                    self._legacy_static_auth = True
+                    return False
                 body_text = await resp.text()
                 if resp.status >= 400:
                     raise CognisBridgeError(
-                        f"fetch_config -> {resp.status}: {body_text[:300]}",
+                        f"mint access token -> {resp.status}: {body_text[:300]}",
                         status=resp.status,
                     )
-                return _parse_bot_config(_safe_json(body_text))
+                body = _safe_json(body_text)
+                tok = body.get("accessToken")
+                ttl = int(body.get("expiresIn") or 0)
+                if not isinstance(tok, str) or not tok:
+                    raise CognisBridgeError("mint access token: malformed response")
+                self._access_token = tok
+                self._access_expiry = time.time() + max(ttl, _ACCESS_REFRESH_SKEW_S)
+                return True
         except aiohttp.ClientError as err:
-            raise CognisBridgeError(f"network: {err}") from err
+            raise CognisBridgeError(f"network (mint token): {err}") from err
+
+    def _auth_headers(self) -> Dict[str, str]:
+        if self._access_token and not self._legacy_static_auth:
+            return {"Authorization": f"Bearer {self._access_token}"}
+        return {"X-Cognis-Bot-Token": self._bot_token}
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json_body: Optional[Dict[str, Any]] = None,
+        op: str = "request",
+    ) -> Dict[str, Any]:
+        """Issue an authenticated request; on 401, refresh the access token once
+        and retry exactly once. Makes a mid-run rotation invisible to the worker.
+        """
+        session = await self._ensure_session()
+        url = f"{self._bridge_url}{path}"
+        await self._ensure_access_token()
+        for attempt in (0, 1):
+            try:
+                async with session.request(
+                    method, url, json=json_body, headers=self._auth_headers()
+                ) as resp:
+                    body_text = await resp.text()
+                    if resp.status == 401 and attempt == 0 and not self._legacy_static_auth:
+                        # Token may have been rotated mid-run — force-refresh once.
+                        await self._ensure_access_token(force=True)
+                        continue
+                    if resp.status >= 400:
+                        raise CognisBridgeError(
+                            f"{op} -> {resp.status}: {body_text[:300]}",
+                            status=resp.status,
+                        )
+                    return _safe_json(body_text)
+            except aiohttp.ClientError as err:
+                raise CognisBridgeError(f"network: {err}") from err
+        raise CognisBridgeError(f"{op}: exhausted auth retry", status=401)
+
+    async def fetch_config(self) -> BotConfig:
+        # Request plaintext exchange keys (Phase 4): the access JWT carries the
+        # keys:read scope, and ?include=keys opts in. Falls back gracefully —
+        # the static-header path returns metadata-only.
+        body = await self._request(
+            "GET", "/trade-bot/config?include=keys", op="fetch_config"
+        )
+        return _parse_bot_config(body)
 
     async def post_events(self, events: List[Dict[str, Any]]) -> int:
         """Returns the count of events Bridge accepted. ``events`` shape:
@@ -180,22 +276,10 @@ class BridgeClient:
         """
         if not events:
             return 0
-        session = await self._ensure_session()
-        try:
-            async with session.post(
-                f"{self._bridge_url}/trade-bot/events",
-                json={"events": events},
-            ) as resp:
-                body_text = await resp.text()
-                if resp.status >= 400:
-                    raise CognisBridgeError(
-                        f"post_events -> {resp.status}: {body_text[:300]}",
-                        status=resp.status,
-                    )
-                body = _safe_json(body_text)
-                return int(body.get("accepted", 0))
-        except aiohttp.ClientError as err:
-            raise CognisBridgeError(f"network: {err}") from err
+        body = await self._request(
+            "POST", "/trade-bot/events", json_body={"events": events}, op="post_events"
+        )
+        return int(body.get("accepted", 0))
 
     async def post_paper_results(
         self, strategy_id: str, results: Dict[str, Any]
@@ -203,25 +287,16 @@ class BridgeClient:
         """Submit paper-trading results. Returns the strategy id Bridge confirms."""
         if not strategy_id:
             raise CognisBridgeError("strategy_id is empty")
-        session = await self._ensure_session()
-        try:
-            async with session.post(
-                f"{self._bridge_url}/trade-bot/paper-results",
-                json={"strategyId": strategy_id, "results": results},
-            ) as resp:
-                body_text = await resp.text()
-                if resp.status >= 400:
-                    raise CognisBridgeError(
-                        f"post_paper_results -> {resp.status}: {body_text[:300]}",
-                        status=resp.status,
-                    )
-                body = _safe_json(body_text)
-                sid = body.get("strategyId")
-                if not isinstance(sid, str):
-                    raise CognisBridgeError("post_paper_results: malformed response")
-                return sid
-        except aiohttp.ClientError as err:
-            raise CognisBridgeError(f"network: {err}") from err
+        body = await self._request(
+            "POST",
+            "/trade-bot/paper-results",
+            json_body={"strategyId": strategy_id, "results": results},
+            op="post_paper_results",
+        )
+        sid = body.get("strategyId")
+        if not isinstance(sid, str):
+            raise CognisBridgeError("post_paper_results: malformed response")
+        return sid
 
     async def aclose(self) -> None:
         if self._session is not None and not self._session.closed:
